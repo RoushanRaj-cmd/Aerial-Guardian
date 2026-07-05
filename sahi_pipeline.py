@@ -7,7 +7,7 @@ from collections import defaultdict
 from sahi import AutoDetectionModel
 from sahi.predict import get_sliced_prediction
 from norfair import Tracker, Detection
-from norfair.camera_motion import MotionEstimator, TranslationTransformationGetter
+from norfair.camera_motion import MotionEstimator, HomographyTransformationGetter
 
 def sahi_to_norfair(sahi_predictions):
     """
@@ -38,10 +38,10 @@ def sahi_to_norfair(sahi_predictions):
 # 1. Initialize SAHI AutoDetectionModel
 print("Loading YOLO11 model into SAHI...")
 detection_model = AutoDetectionModel.from_pretrained(
-    model_type='yolov8', # 'yolov8' supports ultralytics yolo11 weights internally backward-compatibly
-    model_path='yolo11n.pt',
-    confidence_threshold=0.3,
-    device="cpu"
+    model_type='yolov8',
+    model_path='yolo11n.onnx', 
+    confidence_threshold=0.45, # Increased to filter out false detections
+    device="cpu" 
 )
 
 visdrone_seq_dir = "VisDrone2019-MOT-val/sequences"
@@ -69,18 +69,24 @@ for seq_name in sorted(os.listdir(visdrone_seq_dir)):
     out = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*'mp4v'), fps_input, (width, height))
     
     # Initialize Norfair Tracker.
-    # Distance function 'euclidean' acts as a simple, fast tracking mechanism measuring point drift. 
-    # Works excellently for low-fps aerial camera movements on limited-scale centers.
-    tracker = Tracker(distance_function="euclidean", distance_threshold=75)
+    tracker = Tracker(
+        distance_function="mean_euclidean", 
+        distance_threshold=85, # Toned down slightly so it doesn't snap to distant false positives
+        hit_counter_max=30,    # Halved to 30 frames (~1 sec) so ghost tracks die off reasonably fast!
+        past_detections_length=10 # Reduced so it doesn't over-remember dead tracks
+    )
     
-    # Initialize Camera Motion Estimator! Very critical for drones to stop Kalman "ghost" drifting!
+    # Homography handles both ROTATION and translation of the drone camera!
     motion_estimator = MotionEstimator(
-        max_points=500, min_distance=15, transformations_getter=TranslationTransformationGetter()
+        max_points=500, min_distance=15, transformations_getter=HomographyTransformationGetter()
     )
     
     # Dictionary to store the history of tracked centers for the "tail"
     track_history = defaultdict(lambda: [])
-    max_tail_length = 30 # Number of frames the trajectory tail will persist
+    max_tail_length = 15 # Reduced tail length to prevent excessive clutter
+    
+    # Analytics 1: Persistent Heatmap Array (720p)
+    heatmap_layer = np.zeros((720, 1280), dtype=np.float32)
     
     # ENGINEERING TRADEOFF: Interleaved Inference
     inference_interval = 4
@@ -150,13 +156,33 @@ for seq_name in sorted(os.listdir(visdrone_seq_dir)):
             
             center_x, center_y = int(center_x), int(center_y)
 
-            # Draw Bounding Box and ID
+            # Analytics 2: Speed Estimation (Pixels per second)
+            # Calculate speed based on the pixel distance from the last known center
+            track = track_history[track_id]
+            if len(track) > 0:
+                last_x, last_y = track[-1]
+                vx = center_x - last_x
+                vy = center_y - last_y
+                speed_px_per_frame = np.sqrt(vx**2 + vy**2)
+                speed_px_per_sec = speed_px_per_frame * fps_input
+            else:
+                speed_px_per_frame = 0.0
+                speed_px_per_sec = 0.0
+
+            # Draw Bounding Box, ID, and Speed
             cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (255, 0, 255), 2)  # Pink SAHI boxes
-            cv2.putText(annotated_frame, f"ID: {track_id}", (x1, y1 - 10), 
+            label = f"ID: {track_id} | {speed_px_per_sec:.0f} px/s"
+            cv2.putText(annotated_frame, label, (x1, y1 - 10), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
 
+            # Analytics 1: Add this object's center to the heatmap
+            cv2.circle(heatmap_layer, (center_x, center_y), radius=12, color=255.0, thickness=-1)
+
+            # If the tracking line jumps impossibly fast (tracker glitch / ID switch), reset the tail!
+            if speed_px_per_frame > 150:
+                track.clear()
+
             # Update and Draw Trajectory Tail logically using the smoothed centers
-            track = track_history[track_id]
             track.append((center_x, center_y))
             if len(track) > max_tail_length:
                 track.pop(0)
@@ -164,6 +190,24 @@ for seq_name in sorted(os.listdir(visdrone_seq_dir)):
             # Draw the tail using polylines
             points = np.hstack(track).astype(np.int32).reshape((-1, 1, 2))
             cv2.polylines(annotated_frame, [points], isClosed=False, color=(0, 255, 255), thickness=2)
+
+        # Analytics 1: Blend Heatmap Layer onto Annotated Frame
+        # Fade the heatmap quickly so old traffic cools down and disappears immediately!
+        heatmap_layer *= 0.80
+        
+        # Normalize heatmap to 0-255 scale
+        heatmap_norm = np.clip(heatmap_layer, 0, 255).astype(np.uint8)
+        
+        # Apply Jet colormap (Blue=Cold, Red=Hot)
+        heatmap_color = cv2.applyColorMap(heatmap_norm, cv2.COLORMAP_JET)
+        
+        # Create a mask so we only tint the areas where vehicles have actually driven
+        active_mask = heatmap_norm > 0
+        
+        # Blend manually using numpy to avoid OpenCV shape mismatch
+        annotated_frame[active_mask] = (
+            annotated_frame[active_mask] * 0.6 + heatmap_color[active_mask] * 0.4
+        ).astype(np.uint8)
 
         # 6. FPS Calculation & Hardware Logging
         inference_time = time.time() - start_time

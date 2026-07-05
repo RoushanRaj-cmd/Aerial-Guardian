@@ -1,5 +1,7 @@
 opencv-python
+ultralytics
 numpy
-glob
 sahi
 norfair
+onnx
+openvino
